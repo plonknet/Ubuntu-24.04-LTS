@@ -157,8 +157,8 @@ UUID=1234-ABCD  /media/user/MyDrive  exfat  defaults,nofail,uid=1000,gid=1000,um
 ## 🧪 Tested On
 
 - Ubuntu 24.04 LTS (Desktop)
-- Ubuntu 24.04 LTS (Server)
-- Pop!_OS 22.04 / 24.04
+- Ubuntu 24 LTS (Server)
+- Pop!_OS 22.04 (Desktop)
 - Debian 13
 
 Works with:
