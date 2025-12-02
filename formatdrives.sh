@@ -2,10 +2,26 @@
 set -e
 
 ########################################
-# Root-Check
+# Color helpers
+########################################
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+info()    { echo -e "${CYAN}[INFO]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+error()   { echo -e "${RED}[ERROR]${RESET} $*"; }
+success() { echo -e "${GREEN}[OK]${RESET} $*"; }
+header()  { echo -e "\n${BOLD}$*${RESET}\n"; }
+
+########################################
+# Root check
 ########################################
 if [[ $EUID -ne 0 ]]; then
-  echo "Bitte als Root starten: sudo $0"
+  error "Please run this script as root, e.g.: sudo $0"
   exit 1
 fi
 
@@ -13,15 +29,16 @@ REAL_USER="${SUDO_USER:-$USER}"
 USER_ID=$(id -u "$REAL_USER")
 USER_GID=$(id -g "$REAL_USER")
 
-########################################
-# Abhängigkeiten prüfen & installieren
-########################################
-REQUIRED_PKGS=(parted dosfstools exfatprogs ntfs-3g blkid)
+header "Disk & USB Formatter for Ubuntu 24.04"
 
-echo -e "\n=== Disk/USB Formatter für Ubuntu 24.04 ==="
-echo "→ Prüfe benötigte Pakete..."
-
+########################################
+# Dependency check & install
+########################################
+REQUIRED_PKGS=(parted dosfstools exfatprogs ntfs-3g)
 MISSING_PKGS=()
+
+info "Checking required packages..."
+
 for pkg in "${REQUIRED_PKGS[@]}"; do
   if ! dpkg -s "$pkg" >/dev/null 2>&1; then
     MISSING_PKGS+=("$pkg")
@@ -29,19 +46,23 @@ for pkg in "${REQUIRED_PKGS[@]}"; do
 done
 
 if (( ${#MISSING_PKGS[@]} > 0 )); then
-  echo "Folgende Pakete fehlen und werden installiert:"
-  printf '  - %s\n' "${MISSING_PKGS[@]}"
+  warn "The following packages are missing and will be installed:"
+  for p in "${MISSING_PKGS[@]}"; do
+    echo "  - $p"
+  done
   echo
   apt-get update
   apt-get install -y "${MISSING_PKGS[@]}"
 else
-  echo "Alle benötigten Pakete sind bereits installiert."
+  success "All required packages are already installed."
 fi
 
-echo
+if ! command -v blkid >/dev/null 2>&1; then
+  warn "Command 'blkid' not found. It is usually provided by 'util-linux'."
+fi
 
 ########################################
-# System-Root-Device ermitteln (zum Schutz)
+# Detect system (root) device to protect it
 ########################################
 ROOT_PART=$(findmnt -no SOURCE / 2>/dev/null || true)
 ROOT_DEV=""
@@ -50,29 +71,42 @@ if [[ -n "$ROOT_PART" ]]; then
   if [[ -n "$PKNAME" ]]; then
     ROOT_DEV="/dev/$PKNAME"
   else
-    # Fallback
     ROOT_DEV="${ROOT_PART%[0-9]*}"
   fi
 fi
 
+if [[ -n "$ROOT_DEV" ]]; then
+  info "System root device detected and protected: ${BOLD}$ROOT_DEV${RESET}"
+else
+  warn "Could not reliably detect system root device. Please be extra careful!"
+fi
+
 ########################################
-# Gerätetyp wählen: extern oder intern
+# Choose device type: external or internal
 ########################################
-echo "Was möchtest du formatieren?"
-echo "  [1] Externes USB-Laufwerk (Stick / USB-HDD)"
-echo "  [2] Internes Laufwerk (NICHT Systemplatte)"
-read -rp "→ Auswahl (1-2): " TYPE_CHOICE
+echo
+echo -e "${BOLD}What do you want to format?${RESET}"
+echo "  [1] External USB drive (stick / USB HDD / SD card)"
+echo "  [2] Internal drive (NON-system disk only)"
+read -rp "→ Choice (1-2): " TYPE_CHOICE
 
 DEVICES=()
 
 if [[ "$TYPE_CHOICE" == "1" ]]; then
   ########################################
-  # USB-Geräte
+  # External USB drives
   ########################################
   mapfile -t DEVICES < <(
     lsblk -dpno NAME,TRAN,RM,SIZE,MODEL | awk '$2=="usb" && $3=="1"' | while read -r dev tran rm size model; do
-      LABEL=$(lsblk -no LABEL "${dev}1" 2>/dev/null | head -n 1)
-      FSTYPE=$(lsblk -no FSTYPE "${dev}1" 2>/dev/null | head -n 1)
+      # First child partition (if any)
+      PART1=$(lsblk -lnpo NAME "$dev" | sed -n '2p')
+      if [[ -n "$PART1" ]]; then
+        LABEL=$(lsblk -no LABEL "$PART1" 2>/dev/null | head -n 1)
+        FSTYPE=$(lsblk -no FSTYPE "$PART1" 2>/dev/null | head -n 1)
+      else
+        LABEL=""
+        FSTYPE=""
+      fi
       [[ -z "$LABEL" ]] && LABEL="—"
       [[ -z "$FSTYPE" ]] && FSTYPE="—"
       echo "$dev|$size|$FSTYPE|$LABEL|$model|USB"
@@ -80,52 +114,59 @@ if [[ "$TYPE_CHOICE" == "1" ]]; then
   )
 elif [[ "$TYPE_CHOICE" == "2" ]]; then
   ########################################
-  # Interne Laufwerke (keine USB, keine Systemplatte)
+  # Internal drives (no USB, no system disk)
   ########################################
   mapfile -t DEVICES < <(
     lsblk -dpno NAME,TRAN,TYPE,RM,SIZE,MODEL | while read -r dev tran type rm size model; do
-      # Nur echte Disks
+      # Only physical disks
       [[ "$type" != "disk" ]] && continue
-      # Keine USB
+      # Exclude USB
       [[ "$tran" == "usb" ]] && continue
-      # Keine Systemplatte
+      # Exclude root device (system disk)
       [[ -n "$ROOT_DEV" && "$dev" == "$ROOT_DEV" ]] && continue
-      # Label/FS von erster Partition holen (falls vorhanden)
-      PART1="${dev}1"
-      LABEL=$(lsblk -no LABEL "$PART1" 2>/dev/null | head -n 1)
-      FSTYPE=$(lsblk -no FSTYPE "$PART1" 2>/dev/null | head -n 1)
+
+      # First child partition (if any)
+      PART1=$(lsblk -lnpo NAME "$dev" | sed -n '2p')
+      if [[ -n "$PART1" ]]; then
+        LABEL=$(lsblk -no LABEL "$PART1" 2>/dev/null | head -n 1)
+        FSTYPE=$(lsblk -no FSTYPE "$PART1" 2>/dev/null | head -n 1)
+      else
+        LABEL=""
+        FSTYPE=""
+      fi
       [[ -z "$LABEL" ]] && LABEL="—"
       [[ -z "$FSTYPE" ]] && FSTYPE="—"
-      echo "$dev|$size|$FSTYPE|$LABEL|$model|INTERN"
+      echo "$dev|$size|$FSTYPE|$LABEL|$model|INTERNAL"
     done
   )
 else
-  echo "Ungültige Auswahl."
+  error "Invalid choice."
   exit 1
 fi
 
 if (( ${#DEVICES[@]} == 0 )); then
-  echo "❌ Keine passenden Laufwerke gefunden."
+  error "No matching drives found."
   exit 1
 fi
 
 ########################################
-# Geräte anzeigen
+# Show devices
 ########################################
 echo
-echo "Gefundene Laufwerke:"
+header "Detected drives"
+
 i=1
 for entry in "${DEVICES[@]}"; do
   IFS="|" read -r dev size fs label model kind <<< "$entry"
-  printf " [%d] %-12s %-6s %-6s Label=\"%s\"  %-6s  %s\n" \
+  printf " [%d] %-12s %-7s %-7s Label=\"%s\"  %-8s %s\n" \
     "$i" "$dev" "$size" "$fs" "$label" "$kind" "$model"
   ((i++))
 done
 
 echo
-read -rp "→ Nummer des zu formatierenden Laufwerks: " choice
+read -rp "→ Enter the number of the drive to FORMAT: " choice
 if ! [[ "$choice" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#DEVICES[@]})); then
-  echo "Ungültige Auswahl."
+  error "Invalid selection."
   exit 1
 fi
 
@@ -133,93 +174,132 @@ SELECT="${DEVICES[$((choice-1))]}"
 IFS="|" read -r DEV SIZE FSTYPE_OLD LABEL_OLD MODEL KIND <<< "$SELECT"
 
 echo
-echo "⚠️ GEWÄHLT:"
-echo "  Gerät:  $DEV"
-echo "  Typ:    $KIND"
-echo "  Größe:  $SIZE"
-echo "  FS alt: $FSTYPE_OLD"
-echo "  Label:  $LABEL_OLD"
-if [[ "$KIND" == "INTERN" ]]; then
+header "SUMMARY OF SELECTED DRIVE"
+echo -e "  Device : ${BOLD}$DEV${RESET}"
+echo -e "  Type   : ${BOLD}$KIND${RESET}"
+echo -e "  Size   : $SIZE"
+echo -e "  FS old : $FSTYPE_OLD"
+echo -e "  Label  : $LABEL_OLD"
+
+if [[ "$KIND" == "INTERNAL" ]]; then
   echo
-  echo "🚨 ACHTUNG: INTERNES LAUFWERK!"
-  echo "    Stelle sicher, dass dies NICHT die Systemplatte ist."
+  echo -e "${RED}${BOLD}WARNING: INTERNAL DRIVE SELECTED!${RESET}"
+  echo -e "${RED}Make absolutely sure this is NOT your system disk.${RESET}"
 fi
+
 echo
-read -rp "Alle Daten auf $DEV werden GELÖSCHT. Bestätige mit 'YES': " confirm
-[[ "$confirm" != "YES" ]] && { echo "Abgebrochen."; exit 0; }
+echo -e "${RED}${BOLD}This will ERASE ALL DATA on $DEV!${RESET}"
+read -rp "Type ${BOLD}YES${RESET} to continue: " confirm
+if [[ "$confirm" != "YES" ]]; then
+  warn "Aborted by user."
+  exit 0
+fi
 
 ########################################
-# Dateisystem wählen
+# Choose filesystem
 ########################################
 echo
-echo "Neues Dateisystem wählen:"
-echo "  [1] FAT32  (vfat, sehr kompatibel)"
-echo "  [2] exFAT  (für große Dateien)"
-echo "  [3] NTFS   (Windows optimiert)"
-echo "  [4] ext4   (Linux)"
-read -rp "→ Auswahl (1-4): " fs
+header "Filesystem selection"
+echo "  [1] FAT32  (vfat, highly compatible)"
+echo "  [2] exFAT  (large file support, modern OSes)"
+echo "  [3] NTFS   (Windows optimized)"
+echo "  [4] ext4   (Linux native)"
+read -rp "→ Choice (1-4): " fs
 
 case "$fs" in
   1) FSTYPE="vfat" ;;
   2) FSTYPE="exfat" ;;
   3) FSTYPE="ntfs" ;;
   4) FSTYPE="ext4" ;;
-  *) echo "Ungültige Auswahl."; exit 1 ;;
+  *)
+    error "Invalid filesystem choice."
+    exit 1
+    ;;
 esac
 
-read -rp "Neues Label (Name des Laufwerks): " NEWLABEL
-[[ -z "$NEWLABEL" ]] && { echo "Label darf nicht leer sein."; exit 1; }
+read -rp "New volume label (display name of the drive): " NEWLABEL
+if [[ -z "$NEWLABEL" ]]; then
+  error "Label must not be empty."
+  exit 1
+fi
+
+# Use a safer directory name (replace spaces with underscores)
+SAFE_LABEL="${NEWLABEL// /_}"
 
 ########################################
-# Umount & Partition neu anlegen
+# Unmount & create new partition table
 ########################################
 echo
-echo "Unmount & neue Partitionstabelle auf $DEV..."
+header "Preparing drive"
 
-# Alle Partitionen dieses Devices aushängen
+info "Unmounting all partitions on $DEV (if any)..."
 lsblk -no NAME,MOUNTPOINT "$DEV" | tail -n +2 | while read -r name mp; do
   if [[ -n "$mp" ]]; then
-    echo "  umount $mp"
+    info "  umount $mp"
     umount "$mp" || true
   fi
 done
 
+info "Creating new GPT partition table on $DEV..."
 parted -s "$DEV" mklabel gpt
+info "Creating primary partition (1 MiB → 100%)..."
 parted -s "$DEV" mkpart primary 1MiB 100%
-PART="${DEV}1"
 
-########################################
-# Formatieren
-########################################
-echo
-echo "📀 Formatiere → $PART als $FSTYPE (Label \"$NEWLABEL\")"
-
-case "$FSTYPE" in
-  vfat)  mkfs.vfat -F32 -n "$NEWLABEL" "$PART" ;;
-  exfat) mkfs.exfat -n "$NEWLABEL" "$PART" ;;
-  ntfs)  mkfs.ntfs -Q -L "$NEWLABEL" "$PART" ;;
-  ext4)  mkfs.ext4 -L "$NEWLABEL" "$PART" ;;
-esac
-
-UUID=$(blkid -s UUID -o value "$PART" 2>/dev/null || true)
-if [[ -z "$UUID" ]]; then
-  echo "⚠ Konnte UUID von $PART nicht ermitteln. /etc/fstab-Eintrag später evtl. manuell nötig."
+# Determine the newly created partition reliably (2nd line child of DEV)
+PART=$(lsblk -lnpo NAME "$DEV" | sed -n '2p')
+if [[ -z "$PART" ]]; then
+  error "Could not detect newly created partition on $DEV."
+  exit 1
 fi
 
 ########################################
-# Mount-Variante wählen
+# Format partition
 ########################################
 echo
-echo "Wie soll das Laufwerk eingehängt werden?"
-echo "  [1] Nur temporär (jetzt mounten unter /media/$REAL_USER/$NEWLABEL)"
-echo "  [2] Permanent via /etc/fstab (Auto-Mount bei jedem Boot)"
-echo "  [3] Gar nicht mounten (nur formatieren)"
-read -rp "→ Auswahl (1-3): " MOUNT_CHOICE
+header "Formatting partition"
 
-MOUNTPOINT="/media/$REAL_USER/$NEWLABEL"
+info "Formatting $PART as $FSTYPE with label \"$NEWLABEL\"..."
+
+case "$FSTYPE" in
+  vfat)
+    mkfs.vfat -F32 -n "$NEWLABEL" "$PART"
+    ;;
+  exfat)
+    mkfs.exfat -n "$NEWLABEL" "$PART"
+    ;;
+  ntfs)
+    mkfs.ntfs -Q -L "$NEWLABEL" "$PART"
+    ;;
+  ext4)
+    mkfs.ext4 -L "$NEWLABEL" "$PART"
+    ;;
+esac
+
+success "Formatting completed."
+
+UUID=$(blkid -s UUID -o value "$PART" 2>/dev/null || true)
+if [[ -z "$UUID" ]]; then
+  warn "Could not retrieve UUID for $PART. fstab entry may need manual adjustment later."
+else
+  info "Partition UUID: $UUID"
+fi
+
+########################################
+# Mount mode selection
+########################################
+echo
+header "Mount options"
+
+echo "How should this drive be mounted?"
+echo "  [1] Temporarily now under /media/$REAL_USER/$SAFE_LABEL"
+echo "  [2] Permanently via /etc/fstab (auto-mount on boot)"
+echo "  [3] Do not mount (just format)"
+read -rp "→ Choice (1-3): " MOUNT_CHOICE
+
+MOUNTPOINT="/media/$REAL_USER/$SAFE_LABEL"
 mkdir -p "$MOUNTPOINT"
 
-# Mount-Optionen für mount(8) und fstab
+# Mount options
 if [[ "$FSTYPE" == "ext4" ]]; then
   MOUNT_OPTS="defaults"
   FSTAB_OPTS="defaults,nofail,x-systemd.device-timeout=1"
@@ -229,58 +309,64 @@ else
 fi
 
 ########################################
-# Mount umsetzen
+# Apply mount choice
 ########################################
 if [[ "$MOUNT_CHOICE" == "1" ]]; then
   echo
-  echo "🔁 Temporäres Mounten von $PART nach $MOUNTPOINT ..."
+  header "Temporary mount"
+  info "Mounting $PART → $MOUNTPOINT ..."
   mount -t "$FSTYPE" -o "$MOUNT_OPTS" "$PART" "$MOUNTPOINT"
-  echo "✔ Gemountet unter: $MOUNTPOINT"
+  success "Mounted at: $MOUNTPOINT"
 
 elif [[ "$MOUNT_CHOICE" == "2" ]]; then
+  echo
+  header "Persistent mount via /etc/fstab"
+
   if [[ -z "$UUID" ]]; then
-    echo "❌ Keine UUID verfügbar – kann keinen /etc/fstab-Eintrag anlegen."
+    error "No UUID available – cannot safely create /etc/fstab entry."
   else
-    echo
-    echo "📄 Erstelle Backup von /etc/fstab und füge neuen Eintrag hinzu..."
-
     BACKUP="/etc/fstab.backup-$(date +%Y%m%d-%H%M%S)"
+    info "Creating backup of /etc/fstab → $BACKUP"
     cp /etc/fstab "$BACKUP"
-    echo "  Backup: $BACKUP"
 
-    # Doppelten Eintrag vermeiden
-    if grep -q "$UUID" /etc/fstab; then
-      echo "⚠ In /etc/fstab existiert bereits ein Eintrag mit dieser UUID."
-      echo "  Es wird KEIN neuer Eintrag geschrieben. Bitte manuell prüfen."
+    # Avoid duplicate UUID entries
+    if grep -q "UUID=$UUID" /etc/fstab; then
+      warn "An entry with this UUID already exists in /etc/fstab."
+      warn "No new entry was written. Please review /etc/fstab manually."
     else
       FSTAB_LINE="UUID=$UUID  $MOUNTPOINT  $FSTYPE  $FSTAB_OPTS  0  0"
       echo "$FSTAB_LINE" >> /etc/fstab
-      echo "Neuer /etc/fstab-Eintrag:"
+      success "New fstab entry added:"
       echo "  $FSTAB_LINE"
     fi
 
     echo
-    echo "🔁 Mounten jetzt mit: mount $MOUNTPOINT"
-    mount "$MOUNTPOINT" || true
-    echo "✔ Laufwerk (soweit keine Fehler) unter: $MOUNTPOINT"
+    info "Attempting to mount $MOUNTPOINT using the new fstab entry..."
+    mount "$MOUNTPOINT" || warn "Mount command reported an error. Please check /etc/fstab and system logs."
+    success "Drive should now be available at: $MOUNTPOINT"
   fi
 
 elif [[ "$MOUNT_CHOICE" == "3" ]]; then
   echo
-  echo "Kein Mount-Vorgang – Laufwerk bleibt ungemountet."
+  header "No mount selected"
+  info "Drive remains unmounted. You can mount it later manually."
 else
   echo
-  echo "Ungültige Auswahl – kein Mount-Vorgang."
+  warn "Invalid mount choice – skipping mount step."
 fi
 
 ########################################
-# Abschluss
+# Final summary
 ########################################
 echo
-echo "✔ Fertig!"
-echo "  Gerät:     $DEV"
-echo "  Partition: $PART"
-echo "  FS:        $FSTYPE"
-echo "  Label:     $NEWLABEL"
-echo "  Typ:       $KIND"
+header "Done"
+
+echo -e "  Device    : ${BOLD}$DEV${RESET}"
+echo -e "  Partition : ${BOLD}$PART${RESET}"
+echo -e "  Type      : $KIND"
+echo -e "  Filesystem: $FSTYPE"
+echo -e "  Label     : $NEWLABEL"
+echo -e "  Mount dir : $MOUNTPOINT"
+
+success "All operations finished."
 echo
