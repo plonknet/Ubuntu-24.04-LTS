@@ -4,7 +4,6 @@
 <p align="center">
   <img src="https://img.shields.io/badge/bash-v5.0+-blue?style=for-the-badge">
   <img src="https://img.shields.io/badge/Ubuntu-24.04%20LTS-orange?style=for-the-badge">
-  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge">
 </p>
 
 ## ⚠️ Safety Warning
