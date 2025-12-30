@@ -67,7 +67,6 @@ if [[ -n "$ROOT_PART" ]]; then
   if [[ -n "$PKNAME" ]]; then
     ROOT_DEV="/dev/$PKNAME"
   else
-    # Fallback (handles /dev/sda2 style)
     ROOT_DEV="${ROOT_PART%[0-9]*}"
   fi
 fi
@@ -89,53 +88,75 @@ read -rp "→ Choice (1-2): " TYPE_CHOICE
 
 DEVICES=()
 
+########################################
+# Helper: collect metadata for a disk
+########################################
+get_first_partition() {
+  local dev="$1"
+  lsblk -lnpo NAME "$dev" | sed -n '2p'
+}
+
+get_model() {
+  local dev="$1"
+  local m
+  m=$(lsblk -dnpo MODEL "$dev" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+  [[ -z "$m" ]] && m="—"
+  echo "$m"
+}
+
+get_size() {
+  local dev="$1"
+  local s
+  s=$(lsblk -dnpo SIZE "$dev" 2>/dev/null | head -n 1 | tr -d ' ' || true)
+  [[ -z "$s" ]] && s="—"
+  echo "$s"
+}
+
+get_label_fstype_from_part() {
+  local part="$1"
+  local label fstype
+  if [[ -n "$part" ]]; then
+    label=$(lsblk -no LABEL "$part" 2>/dev/null | head -n 1 || true)
+    fstype=$(lsblk -no FSTYPE "$part" 2>/dev/null | head -n 1 || true)
+  fi
+  [[ -z "${label:-}" ]] && label="—"
+  [[ -z "${fstype:-}" ]] && fstype="—"
+  echo "$fstype|$label"
+}
+
+########################################
+# Detect drives robustly (no MODEL parsing issues)
+########################################
 if [[ "$TYPE_CHOICE" == "1" ]]; then
-  ########################################
-  # External USB drives
-  # NOTE: Do NOT filter on RM=1, because many USB HDDs report RM=0
-  ########################################
+  # External USB drives:
+  # - Do NOT filter on RM=1 (USB HDDs often have RM=0)
+  # - Filter by TRAN==usb AND TYPE==disk
   mapfile -t DEVICES < <(
-    lsblk -dpno NAME,TRAN,SIZE,MODEL,TYPE | awk '$2=="usb" && $5=="disk"' | while read -r dev tran size model type; do
-      # First child partition (if any)
-      PART1=$(lsblk -lnpo NAME "$dev" | sed -n '2p')
-      if [[ -n "$PART1" ]]; then
-        LABEL=$(lsblk -no LABEL "$PART1" 2>/dev/null | head -n 1)
-        FSTYPE=$(lsblk -no FSTYPE "$PART1" 2>/dev/null | head -n 1)
-      else
-        LABEL=""
-        FSTYPE=""
-      fi
-      [[ -z "$LABEL" ]] && LABEL="—"
-      [[ -z "$FSTYPE" ]] && FSTYPE="—"
-      echo "$dev|$size|$FSTYPE|$LABEL|$model|USB"
+    lsblk -dpnro NAME,TRAN,TYPE | while read -r dev tran type; do
+      [[ "$type" != "disk" ]] && continue
+      [[ "$tran" != "usb" ]] && continue
+
+      size="$(get_size "$dev")"
+      model="$(get_model "$dev")"
+      part1="$(get_first_partition "$dev")"
+      IFS="|" read -r fstype label <<<"$(get_label_fstype_from_part "$part1")"
+      echo "$dev|$size|$fstype|$label|$model|USB"
     done
   )
 
 elif [[ "$TYPE_CHOICE" == "2" ]]; then
-  ########################################
   # Internal drives (no USB, no system disk)
-  ########################################
   mapfile -t DEVICES < <(
-    lsblk -dpno NAME,TRAN,TYPE,SIZE,MODEL | while read -r dev tran type size model; do
-      # Only physical disks
+    lsblk -dpnro NAME,TRAN,TYPE | while read -r dev tran type; do
       [[ "$type" != "disk" ]] && continue
-      # Exclude USB
       [[ "$tran" == "usb" ]] && continue
-      # Exclude root device (system disk)
       [[ -n "$ROOT_DEV" && "$dev" == "$ROOT_DEV" ]] && continue
 
-      # First child partition (if any)
-      PART1=$(lsblk -lnpo NAME "$dev" | sed -n '2p')
-      if [[ -n "$PART1" ]]; then
-        LABEL=$(lsblk -no LABEL "$PART1" 2>/dev/null | head -n 1)
-        FSTYPE=$(lsblk -no FSTYPE "$PART1" 2>/dev/null | head -n 1)
-      else
-        LABEL=""
-        FSTYPE=""
-      fi
-      [[ -z "$LABEL" ]] && LABEL="—"
-      [[ -z "$FSTYPE" ]] && FSTYPE="—"
-      echo "$dev|$size|$FSTYPE|$LABEL|$model|INTERNAL"
+      size="$(get_size "$dev")"
+      model="$(get_model "$dev")"
+      part1="$(get_first_partition "$dev")"
+      IFS="|" read -r fstype label <<<"$(get_label_fstype_from_part "$part1")"
+      echo "$dev|$size|$fstype|$label|$model|INTERNAL"
     done
   )
 else
@@ -145,6 +166,13 @@ fi
 
 if (( ${#DEVICES[@]} == 0 )); then
   error "No matching drives found."
+  echo
+  warn "Debug info (please check your device is visible):"
+  echo "---- lsblk -dpnro NAME,TRAN,TYPE,SIZE,MODEL ----"
+  lsblk -dpnro NAME,TRAN,TYPE,SIZE,MODEL || true
+  echo "------------------------------------------------"
+  echo
+  warn "If your USB enclosure reports TRAN empty, tell me what the lsblk output shows."
   exit 1
 fi
 
@@ -179,6 +207,7 @@ echo -e "  Type   : ${BOLD}$KIND${RESET}"
 echo -e "  Size   : $SIZE"
 echo -e "  FS old : $FSTYPE_OLD"
 echo -e "  Label  : $LABEL_OLD"
+echo -e "  Model  : $MODEL"
 
 if [[ "$KIND" == "INTERNAL" ]]; then
   echo
@@ -222,7 +251,6 @@ if [[ -z "$NEWLABEL" ]]; then
   exit 1
 fi
 
-# Use a safer directory name (replace spaces with underscores)
 SAFE_LABEL="${NEWLABEL// /_}"
 
 ########################################
@@ -244,7 +272,6 @@ parted -s "$DEV" mklabel gpt
 info "Creating primary partition (1 MiB → 100%)..."
 parted -s "$DEV" mkpart primary 1MiB 100%
 
-# Determine the newly created partition reliably (2nd line child of DEV)
 PART=$(lsblk -lnpo NAME "$DEV" | sed -n '2p')
 if [[ -z "$PART" ]]; then
   error "Could not detect newly created partition on $DEV."
@@ -260,18 +287,10 @@ header "Formatting partition"
 info "Formatting $PART as $FSTYPE with label \"$NEWLABEL\"..."
 
 case "$FSTYPE" in
-  vfat)
-    mkfs.vfat -F32 -n "$NEWLABEL" "$PART"
-    ;;
-  exfat)
-    mkfs.exfat -n "$NEWLABEL" "$PART"
-    ;;
-  ntfs)
-    mkfs.ntfs -Q -L "$NEWLABEL" "$PART"
-    ;;
-  ext4)
-    mkfs.ext4 -L "$NEWLABEL" "$PART"
-    ;;
+  vfat) mkfs.vfat -F32 -n "$NEWLABEL" "$PART" ;;
+  exfat) mkfs.exfat -n "$NEWLABEL" "$PART" ;;
+  ntfs) mkfs.ntfs -Q -L "$NEWLABEL" "$PART" ;;
+  ext4) mkfs.ext4 -L "$NEWLABEL" "$PART" ;;
 esac
 
 success "Formatting completed."
@@ -297,12 +316,10 @@ read -rp "→ Choice (1-3): " MOUNT_CHOICE
 
 MOUNTPOINT="/media/$REAL_USER/$SAFE_LABEL"
 
-# Only create mountpoint if we actually intend to mount
 if [[ "$MOUNT_CHOICE" == "1" || "$MOUNT_CHOICE" == "2" ]]; then
   mkdir -p "$MOUNTPOINT"
 fi
 
-# Mount options
 if [[ "$FSTYPE" == "ext4" ]]; then
   MOUNT_OPTS="defaults"
   FSTAB_OPTS="defaults,nofail,x-systemd.device-timeout=1"
@@ -332,7 +349,6 @@ elif [[ "$MOUNT_CHOICE" == "2" ]]; then
     info "Creating backup of /etc/fstab → $BACKUP"
     cp /etc/fstab "$BACKUP"
 
-    # Avoid duplicate UUID entries
     if grep -q "UUID=$UUID" /etc/fstab; then
       warn "An entry with this UUID already exists in /etc/fstab."
       warn "No new entry was written. Please review /etc/fstab manually."
@@ -353,7 +369,6 @@ elif [[ "$MOUNT_CHOICE" == "3" ]]; then
   echo
   header "No mount selected"
   info "Drive remains unmounted. You can mount it later manually."
-
 else
   echo
   warn "Invalid mount choice – skipping mount step."
