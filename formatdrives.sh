@@ -34,7 +34,7 @@ header "Disk & USB Formatter for Ubuntu 24.04"
 ########################################
 # Dependency check & install
 ########################################
-REQUIRED_PKGS=(parted dosfstools exfatprogs ntfs-3g)
+REQUIRED_PKGS=(parted dosfstools exfatprogs ntfs-3g util-linux)
 MISSING_PKGS=()
 
 info "Checking required packages..."
@@ -57,10 +57,6 @@ else
   success "All required packages are already installed."
 fi
 
-if ! command -v blkid >/dev/null 2>&1; then
-  warn "Command 'blkid' not found. It is usually provided by 'util-linux'."
-fi
-
 ########################################
 # Detect system (root) device to protect it
 ########################################
@@ -71,6 +67,7 @@ if [[ -n "$ROOT_PART" ]]; then
   if [[ -n "$PKNAME" ]]; then
     ROOT_DEV="/dev/$PKNAME"
   else
+    # Fallback (handles /dev/sda2 style)
     ROOT_DEV="${ROOT_PART%[0-9]*}"
   fi
 fi
@@ -95,9 +92,10 @@ DEVICES=()
 if [[ "$TYPE_CHOICE" == "1" ]]; then
   ########################################
   # External USB drives
+  # NOTE: Do NOT filter on RM=1, because many USB HDDs report RM=0
   ########################################
   mapfile -t DEVICES < <(
-    lsblk -dpno NAME,TRAN,RM,SIZE,MODEL | awk '$2=="usb" && $3=="1"' | while read -r dev tran rm size model; do
+    lsblk -dpno NAME,TRAN,SIZE,MODEL,TYPE | awk '$2=="usb" && $5=="disk"' | while read -r dev tran size model type; do
       # First child partition (if any)
       PART1=$(lsblk -lnpo NAME "$dev" | sed -n '2p')
       if [[ -n "$PART1" ]]; then
@@ -112,12 +110,13 @@ if [[ "$TYPE_CHOICE" == "1" ]]; then
       echo "$dev|$size|$FSTYPE|$LABEL|$model|USB"
     done
   )
+
 elif [[ "$TYPE_CHOICE" == "2" ]]; then
   ########################################
   # Internal drives (no USB, no system disk)
   ########################################
   mapfile -t DEVICES < <(
-    lsblk -dpno NAME,TRAN,TYPE,RM,SIZE,MODEL | while read -r dev tran type rm size model; do
+    lsblk -dpno NAME,TRAN,TYPE,SIZE,MODEL | while read -r dev tran type size model; do
       # Only physical disks
       [[ "$type" != "disk" ]] && continue
       # Exclude USB
@@ -233,7 +232,7 @@ echo
 header "Preparing drive"
 
 info "Unmounting all partitions on $DEV (if any)..."
-lsblk -no NAME,MOUNTPOINT "$DEV" | tail -n +2 | while read -r name mp; do
+lsblk -lnpo NAME,MOUNTPOINT "$DEV" | tail -n +2 | while read -r name mp; do
   if [[ -n "$mp" ]]; then
     info "  umount $mp"
     umount "$mp" || true
@@ -297,7 +296,11 @@ echo "  [3] Do not mount (just format)"
 read -rp "→ Choice (1-3): " MOUNT_CHOICE
 
 MOUNTPOINT="/media/$REAL_USER/$SAFE_LABEL"
-mkdir -p "$MOUNTPOINT"
+
+# Only create mountpoint if we actually intend to mount
+if [[ "$MOUNT_CHOICE" == "1" || "$MOUNT_CHOICE" == "2" ]]; then
+  mkdir -p "$MOUNTPOINT"
+fi
 
 # Mount options
 if [[ "$FSTYPE" == "ext4" ]]; then
@@ -350,6 +353,7 @@ elif [[ "$MOUNT_CHOICE" == "3" ]]; then
   echo
   header "No mount selected"
   info "Drive remains unmounted. You can mount it later manually."
+
 else
   echo
   warn "Invalid mount choice – skipping mount step."
@@ -366,7 +370,11 @@ echo -e "  Partition : ${BOLD}$PART${RESET}"
 echo -e "  Type      : $KIND"
 echo -e "  Filesystem: $FSTYPE"
 echo -e "  Label     : $NEWLABEL"
-echo -e "  Mount dir : $MOUNTPOINT"
+if [[ "$MOUNT_CHOICE" == "1" || "$MOUNT_CHOICE" == "2" ]]; then
+  echo -e "  Mount dir : $MOUNTPOINT"
+else
+  echo -e "  Mount dir : —"
+fi
 
 success "All operations finished."
 echo
